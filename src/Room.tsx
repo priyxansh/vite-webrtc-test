@@ -20,6 +20,9 @@ const Room = ({}: RoomProps) => {
   const [myStream, setMyStream] = useState<MediaStream | null>(null);
   const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
+  const [_, setIsAudioMuted] = useState(false);
+  const [__, setIsVideoMuted] = useState(false);
+
   const handleUserJoined = (data: {
     userId: string;
     isBroadcaster: boolean;
@@ -262,6 +265,30 @@ const Room = ({}: RoomProps) => {
     console.log({ myStream, remoteStream });
   }, [myStream, remoteStream]);
 
+  const toggleMute = () => {
+    if (!myStream) {
+      return;
+    }
+
+    myStream.getAudioTracks().forEach((track) => {
+      track.enabled = !track.enabled;
+    });
+
+    setIsAudioMuted((prev) => !prev);
+  };
+
+  const toggleVideo = () => {
+    if (!myStream) {
+      return;
+    }
+
+    myStream.getVideoTracks().forEach((track) => {
+      track.enabled = !track.enabled;
+    });
+
+    setIsVideoMuted((prev) => !prev);
+  };
+
   return (
     <div>
       Room {roomId}
@@ -272,6 +299,8 @@ const Room = ({}: RoomProps) => {
         {myStream ? (
           <div>
             <span>My stream</span>
+            <button onClick={toggleMute}>Toggle Mute</button>
+            <button onClick={toggleVideo}>Toggle Video</button>
             <video
               autoPlay
               playsInline
