@@ -1,6 +1,6 @@
 import { useParams } from "react-router-dom";
 import { useSocket } from "./SocketProvider";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 
 type RoomProps = {};
 
@@ -8,48 +8,104 @@ const Room = ({}: RoomProps) => {
   const { roomId } = useParams();
   const { socket } = useSocket();
 
-  const [isBroadcaster, setIsBroadcaster] = useState(false);
-  const [broadcasterUserId, setBroadcasterUserId] = useState<string | null>(
-    null
-  );
-  const [viewerUserIds, setViewerUserIds] = useState<string[]>([]);
-
-  const broadcasterPeerRef = useRef<RTCPeerConnection | null>(null);
-  const viewerPeersRef = useRef<{ [key: string]: RTCPeerConnection }>({});
-
+  const [peers, setPeers] = useState<{ [key: string]: RTCPeerConnection }>({});
+  const [streams, setStreams] = useState<{ [key: string]: MediaStream }>({});
   const [myStream, setMyStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
 
-  const [_, setIsAudioMuted] = useState(false);
-  const [__, setIsVideoMuted] = useState(false);
+  useEffect(() => {
+    const handleUserJoined = ({
+      userId: _,
+      users,
+    }: {
+      userId: string;
+      users: string[];
+    }) => {
+      users.forEach((id) => {
+        if (id !== socket.id && !peers[id]) {
+          console.log("User joined", id);
+          createPeerConnection(id, false);
+        }
+      });
+    };
 
-  const handleUserJoined = (data: {
-    userId: string;
-    isBroadcaster: boolean;
-    broadcasterId: string;
-  }) => {
-    if (data.userId === data.broadcasterId) {
-      setIsBroadcaster(data.isBroadcaster);
-    }
+    const handleUserLeft = ({ userId }: { userId: string }) => {
+      if (peers[userId]) {
+        peers[userId].close();
+        delete peers[userId];
+        delete streams[userId];
+        setPeers({ ...peers });
+        setStreams({ ...streams });
+      }
+    };
 
-    if (isBroadcaster && !data.isBroadcaster) {
-      setViewerUserIds((prev) => [...prev, data.userId]);
-    }
+    const handleOffer = async ({
+      from,
+      offer,
+    }: {
+      from: string;
+      offer: RTCSessionDescriptionInit;
+    }) => {
+      const peer = createPeerConnection(from, true);
+      await peer.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      socket.emit("answer", { to: from, answer });
+    };
 
-    if (!isBroadcaster) {
-      setBroadcasterUserId(data.broadcasterId);
-    }
-  };
+    const handleAnswer = async ({
+      from,
+      answer,
+    }: {
+      from: string;
+      answer: RTCSessionDescriptionInit;
+    }) => {
+      const peer = peers[from];
+      await peer.setRemoteDescription(new RTCSessionDescription(answer));
+    };
 
-  const handleOffer = async (data: {
-    from: string;
-    offer: RTCSessionDescription;
-  }) => {
+    const handleIceCandidate = async ({
+      from,
+      candidate,
+    }: {
+      from: string;
+      candidate: RTCIceCandidateInit;
+    }) => {
+      const peer = peers[from];
+      await peer.addIceCandidate(new RTCIceCandidate(candidate));
+    };
+
+    socket.on("user-joined", handleUserJoined);
+    socket.on("user-left", handleUserLeft);
+    socket.on("offer", handleOffer);
+    socket.on("answer", handleAnswer);
+    socket.on("ice-candidate", handleIceCandidate);
+
+    return () => {
+      socket.off("user-joined", handleUserJoined);
+      socket.off("user-left", handleUserLeft);
+      socket.off("offer", handleOffer);
+      socket.off("answer", handleAnswer);
+      socket.off("ice-candidate", handleIceCandidate);
+    };
+  }, [socket, peers, streams]);
+
+  useEffect(() => {
+    const init = async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: true,
+        audio: true,
+      });
+      setMyStream(stream);
+      socket.emit("join-room", { roomId });
+    };
+
+    init();
+  }, [roomId, socket]);
+
+  const createPeerConnection = (userId: string, isAnswerer: boolean) => {
     const peer = new RTCPeerConnection({
       iceServers: [
-        {
-          urls: ["stun:stun.l.google.com:19302"],
-        },
+        { urls: ["stun:stun.l.google.com:19302"] },
         {
           urls: "turn:numb.viagenie.ca",
           username: "webrtc@live.com",
@@ -57,251 +113,102 @@ const Room = ({}: RoomProps) => {
         },
       ],
     });
-    broadcasterPeerRef.current = peer;
 
-    await peer.setRemoteDescription(data.offer);
-    const answer = await peer.createAnswer();
-    await peer.setLocalDescription(answer);
-
-    peer.addEventListener("track", (event) => {
-      setRemoteStream(event.streams[0]);
-      console.log(event.streams[0].getTracks(), "remote tracks");
-    });
-
-    peer.addEventListener("icecandidate", (event) => {
+    peer.onicecandidate = (event) => {
       if (event.candidate) {
-        console.log("ice-candidate");
         socket.emit("ice-candidate", {
-          to: broadcasterUserId,
+          to: userId,
           candidate: event.candidate,
         });
       }
-    });
-
-    socket.emit("answer", {
-      to: data.from,
-      answer,
-    });
-  };
-
-  const handleAnswer = async (data: {
-    from: string;
-    answer: RTCSessionDescription;
-  }) => {
-    const peer = viewerPeersRef.current[data.from];
-
-    if (!peer) {
-      console.log("Peer not found");
-      return;
-    }
-
-    await peer.setRemoteDescription(data.answer);
-
-    if (!myStream) {
-      console.log("My stream not found");
-      return;
-    }
-
-    const tracks = myStream.getTracks();
-
-    tracks.forEach((track) => {
-      peer.addTrack(track, myStream);
-    });
-  };
-
-  const handleNegotiationNeeded = async (data: {
-    from: string;
-    offer: RTCSessionDescription;
-  }) => {
-    if (!broadcasterPeerRef.current) {
-      console.log("Broadcaster peer not found");
-      return;
-    }
-
-    await broadcasterPeerRef.current.setRemoteDescription(data.offer);
-    const answer = await broadcasterPeerRef.current.createAnswer();
-    await broadcasterPeerRef.current.setLocalDescription(answer);
-
-    socket.emit("negotiation-done", {
-      to: data.from,
-      answer,
-    });
-  };
-
-  const handleNegotiationDone = async (data: {
-    from: string;
-    answer: RTCSessionDescription;
-  }) => {
-    if (!viewerPeersRef.current[data.from]) {
-      console.log("Viewer peer not found");
-      return;
-    }
-
-    console.log(viewerPeersRef.current[data.from]);
-
-    await viewerPeersRef.current[data.from].setRemoteDescription(data.answer);
-  };
-
-  const handleIceCandidate = async (data: {
-    from: string;
-    candidate: RTCIceCandidate;
-  }) => {
-    console.log({ data, broadcasterUserId, viewerPeersRef, isBroadcaster });
-    if (isBroadcaster) {
-      const peer = viewerPeersRef.current[data.from];
-
-      if (!peer) {
-        console.log("Peer not found");
-        return;
-      }
-
-      await peer.addIceCandidate(data.candidate);
-    } else {
-      if (!broadcasterPeerRef.current) {
-        console.log("Broadcaster peer not found");
-        return;
-      }
-
-      await broadcasterPeerRef.current.addIceCandidate(data.candidate);
-    }
-  };
-
-  useEffect(() => {
-    socket.on("user-joined", handleUserJoined);
-    socket.on("offer", handleOffer);
-    socket.on("answer", handleAnswer);
-    socket.on("negotiation-needed", handleNegotiationNeeded);
-    socket.on("negotiation-done", handleNegotiationDone);
-    socket.on("ice-candidate", handleIceCandidate);
-
-    return () => {
-      socket.off("user-joined", handleUserJoined);
-      socket.off("offer", handleOffer);
-      socket.off("answer", handleAnswer);
-      socket.off("negotiation-needed", handleNegotiationNeeded);
-      socket.off("negotiation-done", handleNegotiationDone);
-      socket.off("ice-candidate", handleIceCandidate);
     };
-  }, [
-    socket,
-    handleUserJoined,
-    handleOffer,
-    handleAnswer,
-    handleNegotiationNeeded,
-    handleNegotiationDone,
-    handleIceCandidate,
-  ]);
 
-  useEffect(() => {
-    if (isBroadcaster) {
-      navigator.mediaDevices
-        .getUserMedia({
-          video: true,
-          audio: true,
-        })
-        .then((stream) => {
-          setMyStream(stream);
-        });
-    }
-  }, [isBroadcaster]);
+    peer.ontrack = (event) => {
+      setStreams((prev) => ({ ...prev, [userId]: event.streams[0] }));
+    };
 
-  useEffect(() => {
-    socket.emit("join-room", { roomId });
-  }, [socket]);
-
-  const startBroadcast = async () => {
-    if (!myStream) {
-      return;
-    }
-
-    viewerUserIds.forEach(async (userId) => {
-      const peer = new RTCPeerConnection({
-        iceServers: [
-          {
-            urls: ["stun:stun.l.google.com:19302"],
-          },
-          {
-            urls: "turn:numb.viagenie.ca",
-            username: "webrtc@live.com",
-            credential: "muazkh",
-          },
-        ],
+    if (myStream) {
+      myStream.getTracks().forEach((track) => {
+        peer.addTrack(track, myStream);
       });
-      viewerPeersRef.current[userId] = peer;
+    }
 
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-
-      peer.addEventListener("negotiationneeded", async () => {
+    if (!isAnswerer) {
+      peer.onnegotiationneeded = async () => {
         const offer = await peer.createOffer();
         await peer.setLocalDescription(offer);
-
-        socket.emit("negotiation-needed", {
-          to: userId,
-          offer,
-        });
-
-        console.log("negotiationneeded");
-      });
-
-      peer.addEventListener("icecandidate", (event) => {
-        if (event.candidate) {
-          console.log("ice-candidate");
-          socket.emit("ice-candidate", {
-            to: userId,
-            candidate: event.candidate,
-          });
-        }
-      });
-
-      socket.emit("offer", {
-        to: userId,
-        offer,
-      });
-    });
-  };
-
-  useEffect(() => {
-    console.log({ myStream, remoteStream });
-  }, [myStream, remoteStream]);
-
-  const toggleMute = () => {
-    if (!myStream) {
-      return;
+        socket.emit("offer", { to: userId, offer });
+      };
     }
 
-    myStream.getAudioTracks().forEach((track) => {
-      track.enabled = !track.enabled;
+    setPeers((prev) => ({ ...prev, [userId]: peer }));
+    return peer;
+  };
+
+  const exitCall = () => {
+    Object.values(peers).forEach((peer) => {
+      peer.close();
     });
 
-    setIsAudioMuted((prev) => !prev);
+    setPeers({});
+    setStreams({});
+    setMyStream(null);
+
+    socket.emit("leave-room", { roomId });
+  };
+
+  const rejoinCall = async () => {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: true,
+    });
+    setMyStream(stream);
+    socket.emit("join-room", { roomId });
+  };
+
+  const toggleAudio = () => {
+    if (myStream) {
+      myStream.getAudioTracks().forEach((track) => {
+        track.enabled = !track.enabled;
+      });
+    }
   };
 
   const toggleVideo = () => {
-    if (!myStream) {
-      return;
+    if (myStream) {
+      myStream.getVideoTracks().forEach((track) => {
+        track.enabled = !track.enabled;
+      });
     }
-
-    myStream.getVideoTracks().forEach((track) => {
-      track.enabled = !track.enabled;
-    });
-
-    setIsVideoMuted((prev) => !prev);
   };
 
   return (
-    <div>
-      Room {roomId}
-      <div>
-        {isBroadcaster ? (
-          <button onClick={startBroadcast}>Start Broadcast</button>
-        ) : null}
-        {myStream ? (
-          <div>
-            <span>My stream</span>
-            <button onClick={toggleMute}>Toggle Mute</button>
-            <button onClick={toggleVideo}>Toggle Video</button>
+    <div className="min-h-screen flex flex-col items-center bg-gray-100 p-4">
+      <h1 className="text-2xl font-bold mb-4">Room {roomId}</h1>
+      <div className="flex space-x-4 mb-4">
+        <button
+          onClick={exitCall}
+          className="px-4 py-2 bg-red-600 text-white rounded-lg"
+        >
+          Exit Call
+        </button>
+        {!myStream && (
+          <button
+            onClick={rejoinCall}
+            className="px-4 py-2 bg-green-600 text-white rounded-lg"
+          >
+            Rejoin Call
+          </button>
+        )}
+      </div>
+      <div className="flex flex-wrap justify-center gap-4">
+        {myStream && (
+          <div className="w-80 bg-white p-4 rounded-lg shadow-lg">
+            <span className="block text-center font-semibold mb-2">
+              My Stream
+            </span>
             <video
+              className="w-full rounded-lg mb-2"
               autoPlay
               playsInline
               muted
@@ -311,22 +218,39 @@ const Room = ({}: RoomProps) => {
                 }
               }}
             />
+            <div className="flex justify-between">
+              <button
+                onClick={toggleAudio}
+                className="px-2 py-1 bg-blue-500 text-white rounded"
+              >
+                Toggle Audio
+              </button>
+              <button
+                onClick={toggleVideo}
+                className="px-2 py-1 bg-blue-500 text-white rounded"
+              >
+                Toggle Video
+              </button>
+            </div>
           </div>
-        ) : null}
-        {remoteStream ? (
-          <div>
-            <span>Remote stream</span>
+        )}
+        {Object.keys(streams).map((key) => (
+          <div key={key} className="w-80 bg-white p-4 rounded-lg shadow-lg">
+            <span className="block text-center font-semibold mb-2">
+              {key}'s Stream
+            </span>
             <video
+              className="w-full rounded-lg"
               autoPlay
               playsInline
               ref={(video) => {
                 if (video) {
-                  video.srcObject = remoteStream;
+                  video.srcObject = streams[key];
                 }
               }}
             />
           </div>
-        ) : null}
+        ))}
       </div>
     </div>
   );
