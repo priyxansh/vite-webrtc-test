@@ -11,6 +11,7 @@ const Room = ({}: RoomProps) => {
   const [peers, setPeers] = useState<{ [key: string]: RTCPeerConnection }>({});
   const [streams, setStreams] = useState<{ [key: string]: MediaStream }>({});
   const [myStream, setMyStream] = useState<MediaStream | null>(null);
+  const [isScreenSharing, setIsScreenSharing] = useState(false);
 
   useEffect(() => {
     const handleUserJoined = ({
@@ -182,6 +183,47 @@ const Room = ({}: RoomProps) => {
     }
   };
 
+  const startScreenShare = async () => {
+    try {
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: true,
+      });
+
+      screenStream.getVideoTracks()[0].onended = () => {
+        stopScreenShare();
+      };
+
+      setIsScreenSharing(true);
+
+      if (myStream) {
+        const videoTrack = myStream.getVideoTracks()[0];
+        myStream.removeTrack(videoTrack);
+        videoTrack.stop();
+        myStream.addTrack(screenStream.getVideoTracks()[0]);
+      }
+
+      Object.values(peers).forEach((peer) => {
+        const sender = peer
+          .getSenders()
+          .find((s) => s.track && s.track.kind === "video");
+        if (sender) {
+          sender.replaceTrack(screenStream.getVideoTracks()[0]);
+        }
+      });
+    } catch (error) {
+      console.error("Error sharing screen: ", error);
+    }
+  };
+
+  const stopScreenShare = () => {
+    if (myStream) {
+      myStream.getVideoTracks()[0].stop();
+      exitCall()
+      rejoinCall();
+    }
+    setIsScreenSharing(false);
+  };
+
   return (
     <div className="min-h-screen flex flex-col items-center bg-gray-100 p-4">
       <h1 className="text-2xl font-bold mb-4">Room {roomId}</h1>
@@ -198,6 +240,22 @@ const Room = ({}: RoomProps) => {
             className="px-4 py-2 bg-green-600 text-white rounded-lg"
           >
             Rejoin Call
+          </button>
+        )}
+        {!isScreenSharing && (
+          <button
+            onClick={startScreenShare}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg"
+          >
+            Share Screen
+          </button>
+        )}
+        {isScreenSharing && (
+          <button
+            onClick={stopScreenShare}
+            className="px-4 py-2 bg-yellow-600 text-white rounded-lg"
+          >
+            Stop Screen Share
           </button>
         )}
       </div>
